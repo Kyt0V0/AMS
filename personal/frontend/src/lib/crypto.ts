@@ -1,0 +1,348 @@
+import { argon2id } from "hash-wasm";
+
+export type Bytes = Uint8Array<ArrayBuffer>;
+
+export interface KdfParams {
+  salt: string;
+  time_cost: number;
+  memory_kib: number;
+  parallelism: number;
+}
+
+export interface KdfPolicy {
+  kdf_time_cost: number;
+  kdf_memory_kib: number;
+  kdf_parallelism: number;
+}
+
+export interface PasswordKeys {
+  authKey: string;
+  wrapKey: CryptoKey;
+}
+
+export interface VaultKeys {
+  vaultKey: CryptoKey;
+}
+
+export interface WrappedAccount {
+  kdf: KdfParams;
+  wrapped_vault_key: string;
+}
+
+export class WrongSecretError extends Error {
+  constructor() {
+    super("Wrong password or corrupted data");
+    this.name = "WrongSecretError";
+  }
+}
+
+const MIN_MEMORY_KIB = 19456;
+const MIN_TIME_COST = 2;
+
+const AAD = {
+  vaultKey: "ams/v2/vault-key",
+  recoveryVaultKey: "ams/v2/vault-key/recovery",
+  entry: (id: string) => `ams/v2/entry|${id}`,
+  entryKey: (id: string) => `ams/v2/entry-key|${id}`,
+};
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+export function utf8(text: string): Bytes {
+  return new Uint8Array(encoder.encode(text));
+}
+
+export function fromUtf8(bytes: Uint8Array): string {
+  return decoder.decode(bytes);
+}
+
+export function toB64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+export function fromB64(text: string): Bytes {
+  const binary = atob(text);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+export function randomBytes(length: number): Bytes {
+  return crypto.getRandomValues(new Uint8Array(length));
+}
+
+export function cryptoAvailable(): boolean {
+  return typeof crypto !== "undefined" && !!crypto.subtle && typeof WebAssembly !== "undefined";
+}
+
+function importAesKey(raw: Bytes): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+async function hkdf(secret: Bytes, info: string): Promise<Bytes> {
+  const key = await crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: utf8(info) },
+    key,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+export async function seal(key: CryptoKey, plaintext: Bytes, aad: string): Promise<string> {
+  const nonce = randomBytes(12);
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: utf8(aad) }, key, plaintext),
+  );
+  const blob = new Uint8Array(nonce.length + ciphertext.length);
+  blob.set(nonce);
+  blob.set(ciphertext, nonce.length);
+  return toB64(blob);
+}
+
+export async function open(key: CryptoKey, blob: string, aad: string): Promise<Bytes> {
+  try {
+    const raw = fromB64(blob);
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: raw.subarray(0, 12), additionalData: utf8(aad) },
+      key,
+      raw.subarray(12),
+    );
+    return new Uint8Array(plaintext);
+  } catch {
+    throw new WrongSecretError();
+  }
+}
+
+export async function derivePasswordKeys(password: string, kdf: KdfParams): Promise<PasswordKeys> {
+  if (kdf.memory_kib < MIN_MEMORY_KIB || kdf.time_cost < MIN_TIME_COST) {
+    throw new Error("The server sent unsafe key-derivation settings. Sign-in was stopped.");
+  }
+  const master = new Uint8Array(
+    await argon2id({
+      password: password.normalize("NFKC"),
+      salt: fromB64(kdf.salt),
+      iterations: kdf.time_cost,
+      memorySize: kdf.memory_kib,
+      parallelism: kdf.parallelism,
+      hashLength: 32,
+      outputType: "binary",
+    }),
+  );
+  try {
+    const authKey = toB64(await hkdf(master, "ams/v2/auth"));
+    const wrapKey = await importAesKey(await hkdf(master, "ams/v2/wrap"));
+    return { authKey, wrapKey };
+  } finally {
+    master.fill(0);
+  }
+}
+
+export function newKdfParams(policy: KdfPolicy): KdfParams {
+  return {
+    salt: toB64(randomBytes(16)),
+    time_cost: policy.kdf_time_cost,
+    memory_kib: policy.kdf_memory_kib,
+    parallelism: policy.kdf_parallelism,
+  };
+}
+
+const BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const RECOVERY_BYTES = 20;
+
+function base32Encode(bytes: Uint8Array): string {
+  let bits = 0;
+  let value = 0;
+  let out = "";
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += BASE32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+    value &= (1 << bits) - 1;
+  }
+  if (bits > 0) out += BASE32[(value << (5 - bits)) & 31];
+  return out;
+}
+
+function base32Decode(text: string): Bytes {
+  const clean = text.toUpperCase().replace(/O/g, "0").replace(/[IL]/g, "1").replace(/[^0-9A-Z]/g, "");
+  const out: number[] = [];
+  let bits = 0;
+  let value = 0;
+  for (const char of clean) {
+    const index = BASE32.indexOf(char);
+    if (index < 0) throw new WrongSecretError();
+    value = ((value << 5) | index) & 0xfff;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(out);
+}
+
+export function generateRecoveryCode(): string {
+  const groups = base32Encode(randomBytes(RECOVERY_BYTES)).match(/.{4}/g) ?? [];
+  return groups.join("-");
+}
+
+export async function deriveRecoveryKeys(code: string): Promise<PasswordKeys> {
+  const secret = base32Decode(code);
+  if (secret.length !== RECOVERY_BYTES) throw new WrongSecretError();
+  const authKey = toB64(await hkdf(secret, "ams/v2/recovery-auth"));
+  const wrapKey = await importAesKey(await hkdf(secret, "ams/v2/recovery-wrap"));
+  return { authKey, wrapKey };
+}
+
+export interface NewAccount extends WrappedAccount {
+  auth_key: string;
+  recovery_auth_key: string;
+  recovery_wrapped_vault_key: string;
+}
+
+async function sealForRecovery(vaultRaw: Bytes) {
+  const code = generateRecoveryCode();
+  const keys = await deriveRecoveryKeys(code);
+  return {
+    code,
+    recovery_auth_key: keys.authKey,
+    recovery_wrapped_vault_key: await seal(keys.wrapKey, vaultRaw, AAD.recoveryVaultKey),
+  };
+}
+
+export async function createAccount(
+  password: string,
+  policy: KdfPolicy,
+): Promise<{ account: NewAccount; recoveryCode: string }> {
+  const kdf = newKdfParams(policy);
+  const passwordKeys = await derivePasswordKeys(password, kdf);
+  const vaultRaw = randomBytes(32);
+  try {
+    const recovery = await sealForRecovery(vaultRaw);
+    return {
+      recoveryCode: recovery.code,
+      account: {
+        kdf,
+        auth_key: passwordKeys.authKey,
+        wrapped_vault_key: await seal(passwordKeys.wrapKey, vaultRaw, AAD.vaultKey),
+        recovery_auth_key: recovery.recovery_auth_key,
+        recovery_wrapped_vault_key: recovery.recovery_wrapped_vault_key,
+      },
+    };
+  } finally {
+    vaultRaw.fill(0);
+  }
+}
+
+export async function unlockAccount(wrapKey: CryptoKey, account: WrappedAccount): Promise<VaultKeys> {
+  const vaultRaw = await open(wrapKey, account.wrapped_vault_key, AAD.vaultKey);
+  try {
+    return { vaultKey: await importAesKey(vaultRaw) };
+  } finally {
+    vaultRaw.fill(0);
+  }
+}
+
+export async function changePassword(currentPassword: string, newPassword: string, account: WrappedAccount, policy: KdfPolicy) {
+  const current = await derivePasswordKeys(currentPassword, account.kdf);
+  const vaultRaw = await open(current.wrapKey, account.wrapped_vault_key, AAD.vaultKey);
+  try {
+    const kdf = newKdfParams(policy);
+    const next = await derivePasswordKeys(newPassword, kdf);
+    return {
+      current_auth_key: current.authKey,
+      kdf,
+      auth_key: next.authKey,
+      wrapped_vault_key: await seal(next.wrapKey, vaultRaw, AAD.vaultKey),
+    };
+  } finally {
+    vaultRaw.fill(0);
+  }
+}
+
+export async function proveCurrentPassword(password: string, account: WrappedAccount): Promise<string> {
+  const keys = await derivePasswordKeys(password, account.kdf);
+  (await open(keys.wrapKey, account.wrapped_vault_key, AAD.vaultKey)).fill(0);
+  return keys.authKey;
+}
+
+export async function replaceRecoveryCode(currentPassword: string, account: WrappedAccount) {
+  const current = await derivePasswordKeys(currentPassword, account.kdf);
+  const vaultRaw = await open(current.wrapKey, account.wrapped_vault_key, AAD.vaultKey);
+  try {
+    const { code, ...material } = await sealForRecovery(vaultRaw);
+    return { code, body: { current_auth_key: current.authKey, ...material } };
+  } finally {
+    vaultRaw.fill(0);
+  }
+}
+
+export async function recoverAccount(
+  recoveryCode: string,
+  recoveryWrappedVaultKey: string,
+  newPassword: string,
+  policy: KdfPolicy,
+) {
+  const recoveryKeys = await deriveRecoveryKeys(recoveryCode);
+  const vaultRaw = await open(recoveryKeys.wrapKey, recoveryWrappedVaultKey, AAD.recoveryVaultKey);
+  try {
+    const kdf = newKdfParams(policy);
+    const next = await derivePasswordKeys(newPassword, kdf);
+    const { code, ...newRecovery } = await sealForRecovery(vaultRaw);
+    return {
+      newRecoveryCode: code,
+      body: {
+        recovery_auth_key: recoveryKeys.authKey,
+        kdf,
+        auth_key: next.authKey,
+        wrapped_vault_key: await seal(next.wrapKey, vaultRaw, AAD.vaultKey),
+        new_recovery: newRecovery,
+      },
+    };
+  } finally {
+    vaultRaw.fill(0);
+  }
+}
+
+export interface EntryAccess {
+  id: string;
+  wrappedKey: string;
+}
+
+async function entryKey(keys: VaultKeys, entry: EntryAccess): Promise<CryptoKey> {
+  const raw = await open(keys.vaultKey, entry.wrappedKey, AAD.entryKey(entry.id));
+  try {
+    return await importAesKey(raw);
+  } finally {
+    raw.fill(0);
+  }
+}
+
+export async function decryptEntry(keys: VaultKeys, entry: EntryAccess, ciphertext: string): Promise<string> {
+  return fromUtf8(await open(await entryKey(keys, entry), ciphertext, AAD.entry(entry.id)));
+}
+
+export async function encryptEntryWithNewKey(keys: VaultKeys, id: string, plaintext: string) {
+  const raw = randomBytes(32);
+  try {
+    return {
+      ciphertext: await seal(await importAesKey(raw), utf8(plaintext), AAD.entry(id)),
+      wrapped_key: await seal(keys.vaultKey, raw, AAD.entryKey(id)),
+    };
+  } finally {
+    raw.fill(0);
+  }
+}
+
+export async function encryptEntry(keys: VaultKeys, entry: EntryAccess, plaintext: string): Promise<string> {
+  return seal(await entryKey(keys, entry), utf8(plaintext), AAD.entry(entry.id));
+}

@@ -1,9 +1,0 @@
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=AMS Startup (Linux)
-Comment=Install/build/start AMS in a terminal window
-Terminal=true
-Exec=bash -lc 'cd "$(dirname "%k")" && ./startup_linux.sh'
-Icon=utilities-terminal
-Categories=Development;

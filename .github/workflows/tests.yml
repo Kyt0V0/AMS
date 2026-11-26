@@ -1,0 +1,57 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.edition }} / ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: [organization, personal]
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-15-intel]
+        python: ["3.13"]
+        include:
+          - { edition: organization, os: ubuntu-latest, python: "3.11" }
+          - { edition: personal, os: ubuntu-latest, python: "3.11" }
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.edition }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Create the Python environment where the app expects it
+        run: |
+          python -m venv backend/.venv
+          if [ -f backend/.venv/Scripts/python.exe ]; then PY=backend/.venv/Scripts/python.exe; else PY=backend/.venv/bin/python; fi
+          echo "PY=$PWD/$PY" >> "$GITHUB_ENV"
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install -r backend/requirements-dev.txt
+
+      - name: Server tests
+        run: cd backend && "$PY" -m pytest -q
+
+      - name: Client tests and production build
+        run: |
+          cd frontend
+          npm ci
+          npm test
+          npm run build
+
+      - name: End-to-end tests (real client code against a real server)
+        run: cd frontend && npm run test:e2e
+
+      - name: Helper scripts start
+        run: |
+          python scripts/start.py --help
+          python scripts/backup.py || true
